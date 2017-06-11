@@ -1,0 +1,135 @@
+Index: include/clang/Basic/LangOptions.def
+===================================================================
+--- include/clang/Basic/LangOptions.def	(revision 285230)
++++ include/clang/Basic/LangOptions.def	(working copy)
+@@ -189,6 +189,8 @@
+ LANGOPT(OpenMPIsDevice    , 1, 0, "Generate code only for OpenMP target device")
+ LANGOPT(RenderScript      , 1, 0, "RenderScript")
+ 
++LANGOPT(StringLiteralTemplates, 1, 0, "Interpret string template arguments as variadic characters")
++
+ LANGOPT(CUDAIsDevice      , 1, 0, "compiling for CUDA device")
+ LANGOPT(CUDAAllowVariadicFunctions, 1, 0, "allowing variadic functions in CUDA device code")
+ LANGOPT(CUDAHostDeviceConstexpr, 1, 1, "treating unattributed constexpr functions as __host__ __device__")
+@@ -268,4 +270,3 @@
+ #undef VALUE_LANGOPT
+ #undef COMPATIBLE_VALUE_LANGOPT
+ #undef BENIGN_VALUE_LANGOPT
+-
+Index: include/clang/Driver/CC1Options.td
+===================================================================
+--- include/clang/Driver/CC1Options.td	(revision 285230)
++++ include/clang/Driver/CC1Options.td	(working copy)
+@@ -594,6 +594,8 @@
+   HelpText<"Default type visibility">;
+ def ftemplate_depth : Separate<["-"], "ftemplate-depth">,
+   HelpText<"Maximum depth of recursive template instantiation">;
++def fstring_literal_templates : Flag<["-"], "fstring-literal-templates">,
++  HelpText<"Interpret string literal template arguments as variadic characters">;
+ def foperator_arrow_depth : Separate<["-"], "foperator-arrow-depth">,
+   HelpText<"Maximum number of 'operator->'s to call for a member access">;
+ def fconstexpr_depth : Separate<["-"], "fconstexpr-depth">,
+@@ -640,7 +642,6 @@
+   HelpText<"Set default MS calling convention">;
+ def finclude_default_header : Flag<["-"], "finclude-default-header">,
+   HelpText<"Include the default header file for OpenCL">;
+-
+ //===----------------------------------------------------------------------===//
+ // Header Search Options
+ //===----------------------------------------------------------------------===//
+Index: include/clang/Sema/Sema.h
+===================================================================
+--- include/clang/Sema/Sema.h	(revision 285230)
++++ include/clang/Sema/Sema.h	(working copy)
+@@ -164,6 +164,7 @@
+   class Stmt;
+   class StringLiteral;
+   class SwitchStmt;
++  typedef SmallVector<ParsedTemplateArgument, 16> TemplateArgList;
+   class TemplateArgument;
+   class TemplateArgumentList;
+   class TemplateArgumentLoc;
+@@ -6157,6 +6158,10 @@
+                                   const TemplateArgument *Args,
+                                   unsigned NumArgs);
+ 
++  void
++  ActOnStringLiteralTemplate(StringLiteral* StringLitArg,
++                             TemplateArgList& TemplateArgs);
++
+   //===--------------------------------------------------------------------===//
+   // C++ Variadic Templates (C++0x [temp.variadic])
+   //===--------------------------------------------------------------------===//
+Index: lib/Frontend/CompilerInvocation.cpp
+===================================================================
+--- lib/Frontend/CompilerInvocation.cpp	(revision 285230)
++++ lib/Frontend/CompilerInvocation.cpp	(working copy)
+@@ -2019,7 +2019,10 @@
+   Opts.HalfArgsAndReturns = Args.hasArg(OPT_fallow_half_arguments_and_returns)
+                             | Opts.NativeHalfArgsAndReturns;
+   Opts.GNUAsm = !Args.hasArg(OPT_fno_gnu_inline_asm);
++  Opts.StringLiteralTemplates =
++  Args.hasArg(options::OPT_fstring_literal_templates);
+ 
++
+   // __declspec is enabled by default for the PS4 by the driver, and also
+   // enabled for Microsoft Extensions or Borland Extensions, here.
+   //
+Index: lib/Lex/PPMacroExpansion.cpp
+===================================================================
+--- lib/Lex/PPMacroExpansion.cpp	(revision 285230)
++++ lib/Lex/PPMacroExpansion.cpp	(working copy)
+@@ -1289,6 +1289,8 @@
+            .Case("cxx_binary_literals", true)
+            .Case("cxx_init_captures", LangOpts.CPlusPlus11)
+            .Case("cxx_variable_templates", LangOpts.CPlusPlus)
++           .Case("cxx_string_literal_templates",
++                 LangOpts.CPlusPlus11 && LangOpts.StringLiteralTemplates)
+            .Default(false);
+ }
+ 
+Index: lib/Parse/ParseTemplate.cpp
+===================================================================
+--- lib/Parse/ParseTemplate.cpp	(revision 285230)
++++ lib/Parse/ParseTemplate.cpp	(working copy)
+@@ -1278,6 +1278,13 @@
+       return true;
+     }
+ 
++    if (getLangOpts().StringLiteralTemplates &&
++        Arg.getKind() == ParsedTemplateArgument::NonType) {
++      if (auto *StringLitArg = dyn_cast<StringLiteral>(Arg.getAsExpr())) {
++        Actions.ActOnStringLiteralTemplate(StringLitArg, TemplateArgs);
++        continue;
++      }
++    }
+     // Save this template argument.
+     TemplateArgs.push_back(Arg);
+       
+Index: lib/Sema/SemaTemplate.cpp
+===================================================================
+--- lib/Sema/SemaTemplate.cpp	(revision 285230)
++++ lib/Sema/SemaTemplate.cpp	(working copy)
+@@ -8867,3 +8867,22 @@
+                           MissingImportKind::PartialSpecialization,
+                           /*Recover*/true);
+ }
++
++/// \brief Instead of using the stringliteral as template argument, we use the
++/// character literals it consists of.
++void Sema::ActOnStringLiteralTemplate(StringLiteral* StringLitArg,
++                                      TemplateArgList& TemplateArgs)
++{
++    for (unsigned CharInd = 0; CharInd < StringLitArg->getLength(); ++CharInd)
++    {
++        SourceLocation Loc = getLocationOfStringLiteralByte(StringLitArg,
++                                                            CharInd);
++        unsigned CharValue = StringLitArg->getString()[CharInd];
++        ExprResult CharLit = new (Context) CharacterLiteral(CharValue,
++                                                        CharacterLiteral::Ascii,
++                                                        Context.CharTy, Loc);
++        ParsedTemplateArgument CharLitArg(ParsedTemplateArgument::NonType,
++                                   CharLit.get(), CharLit.get()->getExprLoc());
++        TemplateArgs.push_back(CharLitArg);
++    }
++}
